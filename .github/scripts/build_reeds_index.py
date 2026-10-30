@@ -17,7 +17,7 @@ Environment variables:
     REEDS_REPO             Path to repo root (default: cwd)
     REEDS_INDEX_DIR        Where to write index.faiss / index.pkl
     REEDS_EMBED_MODEL      gemini:gemini-embedding-001 | hf:BAAI/bge-base-en-v1.5 | ollama:nomic-embed-text
-    REEDS_INCREMENTAL      1 = append to existing index  (default 1)
+    REEDS_INCREMENTAL      1 = replace changed files in existing index (default 1)
     REEDS_SKIP_UNCHANGED   1 = skip files whose content hash matches manifest  (default 1)
     REEDS_EMBED_BATCH      Batch size for embedding calls  (default 16)
     REEDS_EMBED_DEVICE     e.g. "cuda" for HuggingFace GPU
@@ -99,6 +99,9 @@ INCLUDE_FILENAMES = {
 }
 
 EXCLUDE_DIRS = {
+    ".venv",
+    "venv",
+    "node_modules",
     ".git",
     "__pycache__",
     ".pytest_cache",
@@ -221,6 +224,7 @@ def make_splitter(ext: str) -> RecursiveCharacterTextSplitter:
     """Return a text splitter with simple code/document-aware separators."""
     if ext == ".py":
         return RecursiveCharacterTextSplitter(
+            add_start_index=True,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             separators=["\nclass ", "\ndef ", "\n\n", "\n", " ", ""],
@@ -228,6 +232,7 @@ def make_splitter(ext: str) -> RecursiveCharacterTextSplitter:
 
     if ext == ".gms":
         return RecursiveCharacterTextSplitter(
+            add_start_index=True,
             chunk_size=min(CHUNK_SIZE, 900),
             chunk_overlap=min(CHUNK_OVERLAP, 150),
             separators=[";\n", "\n\n", "\n", " ", ""],
@@ -235,6 +240,7 @@ def make_splitter(ext: str) -> RecursiveCharacterTextSplitter:
 
     if ext in {".md", ".rst", ".txt"}:
         return RecursiveCharacterTextSplitter(
+            add_start_index=True,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             separators=["\n## ", "\n### ", "\n#### ", "\n\n", "\n", " ", ""],
@@ -253,12 +259,14 @@ def make_splitter(ext: str) -> RecursiveCharacterTextSplitter:
         ".op2",
     }:
         return RecursiveCharacterTextSplitter(
+            add_start_index=True,
             chunk_size=min(CHUNK_SIZE, 800),
             chunk_overlap=min(CHUNK_OVERLAP, 120),
             separators=["\n", ",", " ", ""],
         )
 
     return RecursiveCharacterTextSplitter(
+        add_start_index=True,
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
     )
@@ -395,9 +403,10 @@ def _embed_with_retry(
                     batch,
                     embeddings,
                     normalize_L2=True,
+                    ids=[c.metadata["chunk_id"] for c in batch],
                 )
 
-            vectordb.add_documents(batch)
+            vectordb.add_documents(batch, ids=[c.metadata["chunk_id"] for c in batch])
             return vectordb
 
         except Exception as e:
@@ -417,6 +426,45 @@ def _embed_with_retry(
     raise RuntimeError(
         f"Failed after {max_retries} retries due to rate limiting."
     )
+
+
+def stable_chunk_id(doc: Document) -> str:
+    """Independent of CI checkout path, run time and random UUIDs."""
+    data = doc.metadata["rel_path"] + "\0" + doc.page_content
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def replace_file(vectordb, chunks, old_ids, embeddings):
+    """Replace only the in-memory file revision; reuse exact-content vectors.
+
+    Disk files are saved only after all files succeed. An embedding error raises
+    and leaves the downloaded index untouched. Call on a staging copy in CI.
+    """
+    unique = {}
+    for doc in chunks:
+        doc.metadata["chunk_id"] = stable_chunk_id(doc)
+        doc.metadata["content_sha256"] = hashlib.sha256(doc.page_content.encode()).hexdigest()
+        unique.setdefault(doc.metadata["chunk_id"], doc)
+    reusable = {}
+    if vectordb is not None and old_ids:
+        positions = {doc_id: position for position, doc_id in vectordb.index_to_docstore_id.items()}
+        wanted = {c.page_content for c in unique.values()}
+        for doc_id in old_ids:
+            old = vectordb.docstore.search(doc_id)
+            if old.page_content in wanted and old.page_content not in reusable:
+                reusable[old.page_content] = vectordb.index.reconstruct(positions[doc_id]).copy()
+        vectordb.delete(old_ids)
+    reused = [c for c in unique.values() if c.page_content in reusable]
+    if reused:
+        vectordb.add_embeddings(
+            [(c.page_content, reusable[c.page_content]) for c in reused],
+            metadatas=[c.metadata for c in reused], ids=[c.metadata["chunk_id"] for c in reused],
+        )
+    new = [c for c in unique.values() if c.page_content not in reusable]
+    for batch in batched(new, EMBED_BATCH_SIZE):
+        vectordb = _embed_with_retry(vectordb, batch, embeddings)
+        time.sleep(EMBED_DELAY)
+    return vectordb
 
 
 # ---------------------------------------------------------------------------
@@ -445,9 +493,12 @@ def main() -> None:
         (out_dir / "index.faiss").exists()
         and (out_dir / "index.pkl").exists()
     )
+    if INCREMENTAL and ((out_dir / "index.faiss").exists() != (out_dir / "index.pkl").exists()):
+        raise RuntimeError("Incomplete previous index pair; preserve it and abort")
 
     # Load previous manifest for skip-unchanged comparison.
     prev_file_sigs: Dict[str, Dict[str, Any]] = {}
+    prev = {}
     prev_manifest_path = out_dir / "manifest.json"
 
     if prev_manifest_path.exists():
@@ -455,21 +506,28 @@ def main() -> None:
             prev = json.loads(prev_manifest_path.read_text(encoding="utf-8"))
             prev_file_sigs = prev.get("file_signatures", {}) or {}
         except Exception as e:
-            print("Warning: failed to read previous manifest:", str(e))
-            prev_file_sigs = {}
+            raise RuntimeError("Previous index manifest is unreadable; preserve it and abort") from e
 
     # Load previous FAISS index when doing incremental update.
     if INCREMENTAL and existing_index:
+        if not prev or prev.get("embed_model") != embed_name:
+            raise RuntimeError("Incremental index requires a matching model manifest")
         try:
             vectordb = FAISS.load_local(
                 str(out_dir),
                 embeddings,
                 allow_dangerous_deserialization=True,
+                normalize_L2=True,
             )
             print("Loaded existing FAISS index from:", out_dir)
         except Exception as e:
-            print("Warning: failed to load existing index; rebuilding.", str(e))
-            vectordb = None
+            raise RuntimeError("Existing index could not load; preserve it and abort") from e
+
+    source_ids = {}
+    if vectordb is not None:
+        for doc_id in vectordb.index_to_docstore_id.values():
+            path = vectordb.docstore.search(doc_id).metadata.get("rel_path")
+            source_ids.setdefault(path, []).append(doc_id)
 
     current_commit = get_git_commit(repo)
 
@@ -486,6 +544,8 @@ def main() -> None:
         "incremental": INCREMENTAL,
         "skip_unchanged": SKIP_UNCHANGED,
         "file_signature_method": "size+sha1",
+        "index_schema_version": 2,
+        "chunk_id_method": "sha256(rel_path + NUL + full_text)",
         "file_signatures": {},
     }
 
@@ -493,8 +553,7 @@ def main() -> None:
     print("Files to consider:", len(files))
 
     if not files:
-        print("No files matched filters.")
-        return
+        raise RuntimeError("No files matched filters; refusing to publish an empty or stale index")
 
     total_chunks = 0
     indexed_files = 0
@@ -508,7 +567,7 @@ def main() -> None:
         if sig:
             new_file_sigs[rel] = sig
 
-        if SKIP_UNCHANGED and INCREMENTAL and existing_index and sig:
+        if SKIP_UNCHANGED and INCREMENTAL and vectordb is not None and sig:
             prev_sig = prev_file_sigs.get(rel)
 
             if (
@@ -521,21 +580,21 @@ def main() -> None:
 
         docs = file_to_documents(repo, fp)
         if not docs:
+            vectordb = replace_file(vectordb, [], source_ids.get(rel, []), embeddings)
             continue
 
         splitter = make_splitter(fp.suffix.lower())
         chunks = splitter.split_documents(docs)
 
         if not chunks:
+            vectordb = replace_file(vectordb, [], source_ids.get(rel, []), embeddings)
             continue
 
         for c in chunks:
             content_bytes = c.page_content.encode("utf-8", errors="ignore")
             c.metadata["chunk_sha1"] = sha1_bytes(content_bytes[:20000])
 
-        for batch in batched(chunks, EMBED_BATCH_SIZE):
-            vectordb = _embed_with_retry(vectordb, batch, embeddings)
-            time.sleep(EMBED_DELAY)
+        vectordb = replace_file(vectordb, chunks, source_ids.get(rel, []), embeddings)
 
         total_chunks += len(chunks)
         indexed_files += 1
@@ -543,6 +602,11 @@ def main() -> None:
     if vectordb is None:
         print("No chunks were indexed.")
         return
+
+    # Deleted/excluded official files must not survive as current search results.
+    removed = [doc_id for path, ids in source_ids.items() if path not in new_file_sigs for doc_id in ids]
+    if removed:
+        vectordb.delete(removed)
 
     vectordb.save_local(str(out_dir))
 
