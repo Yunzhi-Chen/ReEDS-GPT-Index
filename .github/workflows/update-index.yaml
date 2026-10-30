@@ -32,7 +32,7 @@ on:
 
 concurrency:
   group: update-index
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -89,8 +89,18 @@ jobs:
 
           mkdir -p previous_manifest
 
-          gsutil cp "gs://$GCS_BUCKET/manifest.json" previous_manifest/manifest.json \
-            || echo "{}" > previous_manifest/manifest.json
+          # Follow the actual deployed index, including immutable release prefixes.
+          PREVIOUS_URI="$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --region "$CLOUD_RUN_REGION" --project "$GCP_PROJECT" --format=json \
+            | python -c 'import json,sys; s=json.load(sys.stdin); print(next(e["value"] for e in s["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"]=="INDEX_GCS_URI"))')"
+          case "$PREVIOUS_URI" in
+            "gs://$GCS_BUCKET"|"gs://$GCS_BUCKET/"*) ;;
+            *) echo "Unexpected index location; refusing update"; exit 1 ;;
+          esac
+          echo "PREVIOUS_INDEX_URI=$PREVIOUS_URI" >> "$GITHUB_ENV"
+          echo "NEW_INDEX_URI=gs://$GCS_BUCKET/releases/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          # Fail closed on authentication, missing data or invalid manifests.
+          gsutil cp "$PREVIOUS_URI/manifest.json" previous_manifest/manifest.json
 
           PREVIOUS_SHA="$(python - <<'PY'
           import json
@@ -160,7 +170,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_BRANCH }}
+          ref: ${{ steps.check.outputs.upstream_sha }}
           path: reeds-src
           fetch-depth: 0
           lfs: false
@@ -198,13 +208,13 @@ jobs:
           steps.check.outputs.should_build == 'true'
           && steps.check.outputs.is_full_rebuild != 'true'
         run: |
+          set -euo pipefail
           mkdir -p reeds_index
           gsutil -m cp \
-            "gs://$GCS_BUCKET/index.faiss" \
-            "gs://$GCS_BUCKET/index.pkl" \
-            "gs://$GCS_BUCKET/manifest.json" \
-            reeds_index/ \
-          || echo "::warning::No existing index in GCS – will build from scratch"
+            "$PREVIOUS_INDEX_URI/index.faiss" \
+            "$PREVIOUS_INDEX_URI/index.pkl" \
+            "$PREVIOUS_INDEX_URI/manifest.json" \
+            reeds_index/
 
       # ── Build index ───────────────────────────────────────────────
       - name: Build FAISS index
@@ -222,11 +232,13 @@ jobs:
       - name: Upload index to GCS
         if: steps.check.outputs.should_build == 'true'
         run: |
+          set -euo pipefail
+          # A new immutable prefix retains every prior index for rollback.
           gsutil -m cp \
             reeds_index/index.faiss \
             reeds_index/index.pkl \
             reeds_index/manifest.json \
-            "gs://$GCS_BUCKET/"
+            "$NEW_INDEX_URI/"
 
       # ── Restart Cloud Run so it loads the fresh index ─────────────
       - name: Restart Cloud Run service
@@ -235,4 +247,8 @@ jobs:
           gcloud run services update "$CLOUD_RUN_SERVICE" \
             --region "$CLOUD_RUN_REGION" \
             --project "$GCP_PROJECT" \
-            --update-env-vars "INDEX_UPDATED=$(date -u +%Y%m%dT%H%M%SZ)"
+            --update-env-vars "INDEX_GCS_URI=$NEW_INDEX_URI,INDEX_UPDATED=$(date -u +%Y%m%dT%H%M%SZ)"
+          # A previous staged rollout may have pinned traffic to a revision.
+          # Only shift after the new revision has finished loading its index.
+          gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+            --region "$CLOUD_RUN_REGION" --project "$GCP_PROJECT" --to-latest
