@@ -201,8 +201,8 @@ Code within ReEDS should generally point to the links in <code class="docutils l
 <li><p>If set to ‘hierarchical’, then hierarchical clustering is used via</p></li>
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sklearn</span><span class="o">.</span><span class="n">cluster</span><span class="o">.</span><span class="n">AgglomerativeClustering</span><span class="p">(</span>
-    <span class="n">n_clusters</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">sw</span><span class="p">[</span><span class="s1">&#39;GSw_HourlyNumClusters&#39;</span><span class="p">]),</span>
-    <span class="n">affinity</span><span class="o">=</span><span class="s1">&#39;euclidean&#39;</span><span class="p">,</span> <span class="n">linkage</span><span class="o">=</span><span class="s1">&#39;ward&#39;</span><span class="p">)</span>
+    <span class="n">n_clusters</span><span class="o">=</span><span class="nb">int</span><span class="p">(</span><span class="n">sw</span><span class="p">[</span><span class="s1">'GSw_HourlyNumClusters'</span><span class="p">]),</span>
+    <span class="n">affinity</span><span class="o">=</span><span class="s1">'euclidean'</span><span class="p">,</span> <span class="n">linkage</span><span class="o">=</span><span class="s1">'ward'</span><span class="p">)</span>
 </pre></div>
 </div>
 <ul class="simple">
@@ -1242,7 +1242,7 @@ temporally and spatially.</p>
 python<span class="w"> </span>run_hourlize.py<span class="w"> </span>resource<span class="w">              </span><span class="c1"># run resource.py with default cases</span>
 python<span class="w"> </span>run_hourlize.py<span class="w"> </span>resource<span class="w"> </span>-c<span class="w"> </span>suffix<span class="w">    </span><span class="c1"># run resource.py with cases from cases_suffix.json</span>
 python<span class="w"> </span>run_hourlize.py<span class="w"> </span>resource<span class="w"> </span>--local<span class="w">      </span><span class="c1"># if on HPC run all cases sequentially on current node without batch submission to slurm</span>
-python<span class="w"> </span>run_hourlize.py<span class="w"> </span>resource<span class="w"> </span>--nosubmit<span class="w">   </span><span class="c1"># if on HPC create launch scripts and input folders but don&#39;t submit runs</span>
+python<span class="w"> </span>run_hourlize.py<span class="w"> </span>resource<span class="w"> </span>--nosubmit<span class="w">   </span><span class="c1"># if on HPC create launch scripts and input folders but don't submit runs</span>
 </pre></div>
 </div>
 <p>To see details on all command line arguments run <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">run_hourlize.py</span> <span class="pre">-h</span></code>.</p>
@@ -1766,7 +1766,7 @@ These characteristics include:</p>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2024, NREL.
-      <span class="lastupdated">Last updated on May 01, 2026.
+      <span class="lastupdated">Last updated on October 30, 2026.
       </span></p>
   </div>
 
